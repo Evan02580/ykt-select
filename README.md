@@ -1,7 +1,9 @@
 # 雨课堂答题辅助
 
-> 改编自 https://github.com/Niuwh/yuketang-jiaoben，感谢大佬开源。
+> 改编自 https://github.com/Niuwh/yuketang-jiaoben ，感谢大佬开源。
+> 
 > 大佬的项目是刷课 + AI 答题，但因为我搜到了题库，用完那个后我把刷课功能删掉了自己 vibe 了一个题库检索和自动选项的功能。
+> 
 > 没做自动提交是因为容易被检测弹验证。
 
 本地题库检索与答题辅助。
