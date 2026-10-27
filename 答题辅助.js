@@ -1072,7 +1072,7 @@
     applyControlsVisibility(); controlsToolbar.append(toggleControls);
     const autoAnswerBar = element('div', undefined, 'auto-answer-bar'), autoAnswerRow = element('div', undefined, 'row');
     const autoAnswerButton = element('button', '自动选择选项', 'primary');
-    const autoAnswerStatus = element('div', '未开启。首项匹配分 ≥ 80 且答案明确时自动选择，提交请手动操作。', 'auto-answer-status'); autoAnswerStatus.setAttribute('role', 'status'); autoAnswerStatus.setAttribute('aria-live', 'polite');
+    const autoAnswerStatus = element('div', '未开启。首项匹配分 ≥ 60 且答案明确时自动选择，提交请手动操作。', 'auto-answer-status'); autoAnswerStatus.setAttribute('role', 'status'); autoAnswerStatus.setAttribute('aria-live', 'polite');
     autoAnswerButton.onclick = () => void toggleAutoAnswer().catch(error => autoAnswer.stop(`启动失败：${error.message || error}`));
     autoAnswerRow.append(autoAnswerButton); autoAnswerBar.append(autoAnswerRow, autoAnswerStatus);
     body.append(controlsToolbar, autoAnswerBar, controls, results); panel.append(header, body, resizeHandle); shadow.append(style, panel); document.body.append(host);
