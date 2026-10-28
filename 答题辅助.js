@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         题库检索助手
 // @namespace    http://tampermonkey.net/
-// @version      5.1.2
+// @version      5.2.0
 // @description  本地题库检索、OCR 与自动选择选项
 // @author       风之子（原版）；Evan（检索版改编）
 // @license      GPL-3.0-only
@@ -261,76 +261,115 @@
   }
   function definiteCandidate(matches) {
     const best = matches[0];
-    if (!best || !Number.isFinite(best.score) || best.score < 0.6) throw new Error(`首项匹配分${best ? ` ${(best.score * 100).toFixed(2)}` : '不足'}，低于 60，已停止`);
+    if (!best || !Number.isFinite(best.score)) throw new Error('尚未找到候选题目');
     const answer = definiteAnswer(best.question);
-    for (const rival of matches.slice(1)) {
-      if (best.score - rival.score > 0.06) continue;
-      const other = definiteAnswer(rival.question);
-      if (normalize(rival.question.question) !== normalize(best.question.question)
-          || [...answer.texts].sort().join('|') !== [...other.texts].sort().join('|')) throw new Error('前几个匹配项接近且答案或题干不同，答案不确定');
+    const warnings = [];
+    if (best.score < 0.6) warnings.push(`匹配分 ${(best.score * 100).toFixed(1)}，低于 60，请核对`);
+    if (matches[1] && best.score - matches[1].score <= 0.06) warnings.push('前几个候选接近，已采用首项');
+    return { best, answer, warnings };
+  }
+  function optionSimilarity(left, right) {
+    const a = normalize(stripOptionLabel(left)), b = normalize(stripOptionLabel(right));
+    if (!a || !b) return 0;
+    if (a === b) return 1;
+    // 编辑距离兼容短选项的单字 OCR 错误，双字重合度兼容换行、漏字。
+    const x = a.slice(0, 1000), y = b.slice(0, 1000);
+    let previous = Array.from({ length: y.length + 1 }, (_, i) => i);
+    for (let i = 1; i <= x.length; i++) {
+      const row = [i];
+      for (let j = 1; j <= y.length; j++) row[j] = Math.min(row[j - 1] + 1, previous[j] + 1, previous[j - 1] + (x[i - 1] === y[j - 1] ? 0 : 1));
+      previous = row;
     }
-    return { best, answer };
+    const gramsA = bigrams(x), gramsB = bigrams(y);
+    const common = [...gramsA].filter(gram => gramsB.has(gram)).length;
+    return Math.max(1 - previous[y.length] / Math.max(x.length, y.length), 2 * common / (gramsA.size + gramsB.size));
   }
   function planAutoAnswer(matches, pageOptions) {
-    const { best, answer } = definiteCandidate(matches);
+    const { best, answer, warnings } = definiteCandidate(matches);
     if (answer.boolean !== null) {
       if (pageOptions.length !== 2) throw new Error('判断题的页面选项数量不明确');
       const values = pageOptions.map(booleanAnswer);
       if (values.some(x => x === null) || new Set(values).size !== 2) throw new Error('无法区分页面中的正确/错误选项');
-      return { indices: [values.indexOf(answer.boolean)], score: best.score, question: best.question };
+      return { indices: [values.indexOf(answer.boolean)], score: best.score, question: best.question, mappingScore: 1, warnings };
     }
-    const bankOptions = best.question.options.map(option => normalize(option.text)), actual = pageOptions.map(normalize);
-    if (actual.length !== bankOptions.length || actual.length < 2 || actual.some(x => !x)
-        || new Set(actual).size !== actual.length || new Set(bankOptions).size !== bankOptions.length
-        || actual.some(text => !bankOptions.includes(text))) throw new Error('页面选项与题库不能逐一对应，答案不确定');
-    return { indices: answer.texts.map(text => actual.indexOf(text)), score: best.score, question: best.question };
+    const options = best.question.options, count = Math.max(options.length, pageOptions.length);
+    if (pageOptions.length < 2 || count > 8) throw new Error('页面选项尚未就绪');
+    const scores = options.map(option => pageOptions.map(text => optionSimilarity(option.text, text)));
+    // 对所有选项统一分配位置，避免多选答案被映射到同一个控件；同分时用题库字母顺序兜底。
+    const memo = new Map();
+    const assign = (row, used) => {
+      if (row === options.length) return { score: 0, indices: [] };
+      const key = `${row}:${used}`;
+      if (memo.has(key)) return memo.get(key);
+      let bestAssignment = { score: -Infinity, indices: [] };
+      for (let col = 0; col < count; col++) {
+        if (used & (1 << col)) continue;
+        const rest = assign(row + 1, used | (1 << col));
+        const score = (scores[row][col] || 0) + (col === row ? 0.0001 : 0) + rest.score;
+        if (score > bestAssignment.score) bestAssignment = { score, indices: [col, ...rest.indices] };
+      }
+      memo.set(key, bestAssignment); return bestAssignment;
+    };
+    const mapping = assign(0, 0).indices;
+    const indices = best.question.answer.labels.map(label => mapping[options.findIndex(option => option.label === label)]);
+    if (indices.some(i => !Number.isInteger(i) || i >= pageOptions.length)) throw new Error('答案对应的页面选项尚未显示');
+    const mappingScore = scores.reduce((sum, row, i) => sum + (row[mapping[i]] || 0), 0) / Math.max(1, options.length);
+    if (mappingScore < 0.35) warnings.push('选项识别较弱，已结合相似文字及题库字母顺序选择，请核对');
+    else if (mappingScore < 1) warnings.push('选项存在 OCR 差异，已按相似文字对应');
+    if (options.length !== pageOptions.length) warnings.push('页面与题库选项数量不同，请核对');
+    return { indices, score: best.score, question: best.question, mappingScore, warnings };
   }
 
   class AutoAnswerSession {
     constructor(adapter) { this.adapter = adapter; this.enabled = false; this.phase = 'stopped'; this.serial = 0; this.cleanup = null; this.handled = new Set(); }
     update(message) { this.adapter.update(message, this); }
     release() { this.cleanup?.(); this.cleanup = null; }
-    start(unit) { this.release(); this.serial++; this.enabled = true; this.phase = 'waiting'; this.unit = unit; this.handled.clear(); this.update('自动选择已开启，正在识别当前题目…'); }
+    start(unit) {
+      this.release(); this.serial++; this.enabled = true; this.phase = 'waiting'; this.unit = unit; this.handled.clear();
+      this.cleanup = this.adapter.guard(null, () => this.stop('检测到手动改选或取消，已停止自动选择；保留你的选择'));
+      this.update('自动选择已开启，正在识别当前题目…');
+    }
     stop(reason = '已停止自动选择') { this.release(); this.serial++; this.enabled = false; this.phase = 'stopped'; this.update(reason); }
+    defer(reason) { if (!this.enabled) return; this.serial++; this.phase = 'waiting'; this.update(`${reason}；自动选择保持开启，等待重试或下一题。`); }
     poll() {
       if (!this.enabled) return false;
       const current = this.adapter.current();
-      if (current.unit !== this.unit) { this.stop('已离开当前单元，自动选择停止'); return true; }
+      if (current.unit !== this.unit) { this.serial++; this.unit = current.unit; this.handled.clear(); this.phase = 'waiting'; this.adapter.next(); }
       if (this.phase === 'selected') {
         if (current.identity && current.identity !== this.context.identity) {
-          if (this.handled.has(current.identity)) { this.stop('当前题已选择过，停止以避免覆盖已有选项'); return true; }
-          this.release(); this.phase = 'waiting'; this.adapter.next(); this.update('已检测到切题，等待下一题稳定…'); return false;
+          this.phase = 'waiting'; this.adapter.next(); this.update('已检测到切题，等待下一题稳定…'); return false;
         }
         return true;
       }
       if (this.phase === 'selecting') {
         try { this.adapter.verify(this.context, this.plan, false); }
-        catch (error) { this.stop(error.message || String(error)); }
+        catch (error) { this.defer(error.message || String(error)); }
         return true;
       }
-      if (!current.signature) { this.stop('没有可识别的当前题目，已停止自动选择'); return true; }
+      if (!current.signature) return true;
       return false;
     }
     async accept(context) {
       if (!this.enabled || this.phase !== 'waiting') return;
       const serial = this.serial;
       try {
-        this.plan = await this.adapter.plan(context, () => this.enabled && this.serial === serial);
+        const plan = await this.adapter.plan(context, () => this.enabled && this.serial === serial);
         if (!this.enabled || serial !== this.serial) return;
-        if (this.handled.has(context.identity)) throw new Error('当前题已选择过，不能重复选择');
-        this.context = context; this.phase = 'selecting';
-        this.adapter.verify(context, this.plan, false);
-        this.cleanup = this.adapter.guard(context, () => this.stop('检测到手动改选，已停止自动选择；保留你的选择'));
-        this.update('已匹配明确答案，正在勾选页面选项…');
-        await this.adapter.choose(context, this.plan, () => this.enabled && this.serial === serial);
+        if (this.handled.has(context.identity)) {
+          this.context = context; this.phase = 'selected'; this.update('本题已自动选择过，保留现有选项；自动选择仍开启。'); return;
+        }
+        this.context = context; this.plan = plan; this.phase = 'selecting';
+        this.adapter.verify(context, plan, false);
+        this.update('已匹配候选答案，正在勾选页面选项…');
+        await this.adapter.choose(context, plan, () => this.enabled && this.serial === serial);
         if (!this.enabled || serial !== this.serial) return;
-        this.adapter.verify(context, this.plan, true);
+        this.adapter.verify(context, plan, true);
         this.phase = 'selected'; this.handled.add(context.identity);
-        const selectedText = this.plan.question.type === 'true_false'
-          ? (this.plan.question.answer.boolean ? '正确（✓）' : '错误（×）')
-          : this.plan.indices.map(i => String.fromCharCode(65 + i)).join('、');
-        this.update(`已选 ${selectedText}。请手动点击网页“提交”；切到下一题后继续识别。`);
-      } catch (error) { if (this.enabled && serial === this.serial) this.stop(error.message || String(error)); }
+        const selectedText = plan.question.type === 'true_false'
+          ? (plan.question.answer.boolean ? '正确（✓）' : '错误（×）')
+          : plan.indices.map(i => String.fromCharCode(65 + i)).join('、');
+        this.update(`已选 ${selectedText}。${plan.warnings?.length ? `提示：${plan.warnings.join('；')}。` : ''}请手动点击网页“提交”；切到下一题后继续识别。`);
+      } catch (error) { if (this.enabled && serial === this.serial) this.defer(error.message || String(error)); }
     }
   }
 
@@ -419,10 +458,14 @@
     const canvas = ui.previewCanvas;
     if (!canvas || ui.encodedCanvas === canvas) return;
     ui.encodedCanvas = canvas;
-    canvas.toBlob(blob => {
+    canvas.toBlob(async blob => {
       if (!blob || ui.previewCanvas !== canvas) return;
-      if (ui.previewURL) URL.revokeObjectURL(ui.previewURL);
-      ui.previewURL = URL.createObjectURL(blob); ui.previewImage.src = ui.previewURL;
+      const url = URL.createObjectURL(blob), next = new Image(); next.src = url;
+      try { await next.decode(); } catch (_) { URL.revokeObjectURL(url); return; }
+      if (ui.previewCanvas !== canvas) { URL.revokeObjectURL(url); return; }
+      const previous = ui.previewURL;
+      ui.previewURL = url; ui.previewImage.src = url;
+      if (previous) URL.revokeObjectURL(previous);
     }, 'image/png');
   }
 
@@ -443,11 +486,11 @@
     if (!file) return;
     if (state.busy || capturePending) { status('正在识别或等待共享授权，请完成后再拖入或粘贴图片'); return; }
     if (!state.index) { status('请先导入 JSON 题库'); return; }
-    if (autoAnswer?.enabled) autoAnswer.stop('已导入手动截图，停止自动选择；截图结果仅用于展示');
+    if (autoAnswer?.enabled) autoAnswer.defer('手动截图仅用于检索展示');
     const epoch = ++state.epoch;
     state.busy = true; ui.ocr.disabled = true; ui.imageButton.disabled = true;
     warmOCR();
-    clearResults('正在识别截图…'); status('正在读取截图…');
+    keepResults('正在识别截图…'); status('正在读取截图…');
     try {
       const canvas = await screenshotCanvas(file); showPreview(canvas, `导入图片：${file.name}`);
       const data = await runOCR(canvas, epoch);
@@ -459,7 +502,7 @@
       ui.query.value = text; renderResults(text);
       status(`截图识别完成${Number.isFinite(data.elapsedMs) ? ` · ${(data.elapsedMs / 1000).toFixed(1)} 秒${data.retried ? '（含高清复核）' : ''}` : ''}${Number.isFinite(data.confidence) ? ` · OCR 置信度 ${Math.round(data.confidence)}` : ''}。请核对候选题目。`);
     } catch (error) {
-      if (state.epoch === epoch) { clearResults('截图识别失败，可手动输入关键词检索。'); status(error.message || String(error)); }
+      if (state.epoch === epoch) { keepResults('截图识别失败，可手动输入关键词检索。'); status(error.message || String(error)); }
     } finally { state.busy = false; ui.ocr.disabled = false; ui.imageButton.disabled = false; ui.imageFile.value = ''; }
   }
 
@@ -543,7 +586,7 @@
     finally { capturePending = false; ui.capture.disabled = false; }
   }
   function stopCapture() {
-    if (autoAnswer?.enabled) autoAnswer.stop('画面共享已停止，自动选择停止');
+    if (autoAnswer?.enabled) autoAnswer.defer('画面共享已结束，需要时请重新连接');
     captureStream?.getTracks().forEach(t => t.stop());
     if (captureVideo) { captureVideo.pause(); captureVideo.srcObject = null; }
     captureStream = null; captureVideo = null;
@@ -565,17 +608,31 @@
     const scale = Math.min(1, Math.sqrt(24000000 / Math.max(1, sourceWidth * sourceHeight)));
     const canvas = document.createElement('canvas');
     canvas.width = Math.max(1, Math.round(sourceWidth * scale)); canvas.height = Math.max(1, Math.round(sourceHeight * scale));
-    // 避免助手窗口挡住题目；等待共享视频更新后截取，不改变题目本身。
-    const previous = host.style.visibility;
-    host.style.setProperty('visibility', 'hidden', 'important');
-    try {
+    // 助手挡住题目时移到空白处并保持位置，截图过程中不再隐藏/显示窗口。
+    const panelRect = host.getBoundingClientRect();
+    const position = capturePanelPosition(rect, panelRect, innerWidth, innerHeight);
+    if (!position) throw new Error('助手遮挡题目且没有足够空白，请收起或缩小助手窗口，或缩小网页后重试');
+    if (position.left !== panelRect.left || position.top !== panelRect.top) {
+      ui.geometry.moveTo(position);
       await new Promise(resolve => setTimeout(resolve, 220));
-      if (captureVideo !== video || !captureStream?.active) throw new Error('共享已停止');
-      canvas.getContext('2d').drawImage(video, Math.max(0, left) * sx, Math.max(0, top) * sy, sourceWidth, sourceHeight, 0, 0, canvas.width, canvas.height);
-    } finally {
-      if (previous) host.style.setProperty('visibility', previous, 'important'); else host.style.removeProperty('visibility');
     }
+    if (captureVideo !== video || !captureStream?.active) throw new Error('共享已结束');
+    canvas.getContext('2d').drawImage(video, Math.max(0, left) * sx, Math.max(0, top) * sy, sourceWidth, sourceHeight, 0, 0, canvas.width, canvas.height);
     return canvas;
+  }
+  function capturePanelPosition(target, panel, width, height) {
+    const free = ({ left, top }) => left + panel.width + 8 <= target.left || left >= target.left + target.width + 8
+      || top + panel.height + 8 <= target.top || top >= target.top + target.height + 8;
+    const current = { left: panel.left, top: panel.top };
+    if (free(current)) return current;
+    const positions = [];
+    for (const left of [panel.left, 8, width - panel.width - 8, target.left - panel.width - 8, target.left + target.width + 8]) {
+      for (const top of [panel.top, 8, height - panel.height - 8, target.top - panel.height - 8, target.top + target.height + 8]) {
+        if (left >= 8 && top >= 8 && left + panel.width <= width - 8 && top + panel.height <= height - 8 && free({ left, top })) positions.push({ left, top });
+      }
+    }
+    positions.sort((a, b) => Math.hypot(a.left - panel.left, a.top - panel.top) - Math.hypot(b.left - panel.left, b.top - panel.top));
+    return positions[0] || null;
   }
 
   const state = { index: null, busy: false, auto: true, epoch: 0, fingerprint: '', stable: '', seenAt: 0, attempt: '', attemptAt: 0 };
@@ -586,7 +643,7 @@
     if (className) node.className = className;
     return node;
   }
-  function status(message) { ui.status.textContent = message; }
+  function status(message) { if (ui.status.textContent !== message) ui.status.textContent = message; }
   function visible(node) {
     const view = node.ownerDocument.defaultView, style = view.getComputedStyle(node), rect = node.getBoundingClientRect();
     return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 5 && rect.height > 5
@@ -675,7 +732,7 @@
     const selector = 'li, .option-item, .answer-item, label.el-radio, label.el-checkbox, [role="radio"], [role="checkbox"]';
     const all = [...(list || root).querySelectorAll(selector)].filter(node => visible(node));
     const nodes = all.filter(node => !all.some(other => other !== node && other.contains(node)));
-    if (nodes.length < 2 || nodes.length > 8) throw new Error('未找到数量明确的页面选项，已停止');
+    if (nodes.length < 2 || nodes.length > 8) throw new Error('未找到数量明确的页面选项');
     return nodes;
   }
   function optionSelected(node) {
@@ -697,13 +754,13 @@
     return `${unitKey()}|${start >= 0 ? body.slice(0, start) : body}|${options.join('|')}`;
   }
   function verifyAutoContext(context, plan, requireSelection) {
-    if (document.hidden) throw new Error('页面已转入后台，自动选择停止');
+    if (document.hidden) throw new Error('页面在后台，回到当前页后继续');
     if (unitKey() !== context.unit || !context.target.isConnected || fingerprint(context.target) !== context.signature
-        || findQuestion() !== context.target) throw new Error('当前题目已变化，已停止自动选择');
+        || findQuestion() !== context.target) throw new Error('当前题目已变化，等待新题');
     const currentOptions = pageOptions(context.target);
-    if (currentOptions.length !== context.nodes.length || currentOptions.some((node, i) => node !== context.nodes[i] || controlDisabled(node))) throw new Error('页面选项已变化或不可操作，已停止');
+    if (currentOptions.length !== context.nodes.length || currentOptions.some((node, i) => node !== context.nodes[i] || controlDisabled(node))) throw new Error('页面选项正在变化或暂不可操作');
     if (requireSelection) {
-      if (context.nodes.some((node, i) => optionSelected(node) !== plan.indices.includes(i))) throw new Error('选中状态与题库答案不一致，已停止自动选择');
+      if (context.nodes.some((node, i) => optionSelected(node) !== plan.indices.includes(i))) throw new Error('页面未完成选中，等待重试');
     }
   }
   function createAutoSession() {
@@ -715,66 +772,103 @@
       },
       next: () => { state.fingerprint = ''; state.stable = ''; state.attempt = ''; },
       update: (message, session) => {
-        ui.autoAnswerButton.textContent = session.enabled ? '停止自动选择' : '自动选择选项';
+        ui.autoAnswerButton.textContent = session.enabled ? '取消自动选择' : '自动选择选项';
+        ui.autoAnswerButton.classList.toggle('danger', session.enabled);
+        ui.autoAnswerButton.setAttribute('aria-pressed', String(session.enabled));
         ui.autoAnswerStatus.textContent = message;
       },
       plan: async (context, active) => {
         const { best } = definiteCandidate(context.matches);
-        if (Number.isFinite(context.confidence) && context.confidence < 60) throw new Error('OCR 置信度过低，答案不确定，已停止');
-        definiteAnswer(best.question);
         context.nodes = pageOptions(context.target); context.identity = questionIdentity(context.target);
+        const finish = plan => {
+          if (Number.isFinite(context.confidence) && context.confidence < 60) plan.warnings.push(`OCR 置信度 ${Math.round(context.confidence)}，请核对`);
+          return plan;
+        };
         if (best.question.type === 'true_false') {
           const values = context.nodes.map(booleanOptionValue);
           const optionTexts = values.length === 2 && values.every(value => value !== null) && new Set(values).size === 2
             ? values.map(value => value ? '正确' : '错误')
             : recognizedBooleanOptions(context.text, context.nodes.length);
-          return planAutoAnswer(context.matches, optionTexts);
+          return finish(planAutoAnswer(context.matches, optionTexts));
         }
         const isCheckbox = context.nodes.some(node => node.matches('[role="checkbox"], .el-checkbox') || node.querySelector('input[type="checkbox"], [role="checkbox"], .el-checkbox'));
-        if (best.question.type === 'multiple_choice' && !isCheckbox) throw new Error('多选题页面控件类型不明确，已停止');
-        if (best.question.type === 'single_choice' && isCheckbox) throw new Error('页面题型与题库不一致，已停止');
+        if (best.question.type === 'multiple_choice' && !isCheckbox) throw new Error('多选题页面控件尚未就绪');
+        if (best.question.type === 'single_choice' && isCheckbox) throw new Error('页面题型与首项候选不同，请核对');
         const strategies = [
           () => context.nodes.map(node => stripOptionLabel(node.innerText)),
           () => parseRecognizedOptions(context.text, context.nodes.length),
           () => optionsByTextOrder(context.text, best.question.options)
         ];
-        let lastError;
+        let preferred = null;
         for (const read of strategies) {
-          try { return planAutoAnswer(context.matches, read()); } catch (error) { lastError = error; }
+          try {
+            const plan = planAutoAnswer(context.matches, read());
+            if (!preferred || plan.mappingScore > preferred.mappingScore) preferred = plan;
+            if (preferred.mappingScore === 1) return finish(preferred);
+          } catch (_) { /* 某一种拆分不完整时继续尝试，保留自动模式。 */ }
         }
-        if (!captureStream?.active) throw new Error(`${lastError?.message || '选项不明确'}；请共享当前标签页后逐项识别`);
-        // 整题 OCR 可能把方框或 B/8 混淆；按每个实际控件的坐标单独识别文字。
-        const worker = await deadline(getOCRWorker(), 90000, 'OCR 引擎未就绪');
-        const readings = [];
-        for (let i = 0; i < context.nodes.length; i++) {
-          if (!active()) throw new Error('自动选择已停止');
-          verifyAutoContext(context, null, false);
-          autoAnswer.update(`正在逐项核对选项 ${i+1}/${context.nodes.length}…`);
-          const node = context.nodes[i], style = node.ownerDocument.defaultView.getComputedStyle(node);
-          const lineHeight = parseFloat(style.lineHeight) || (parseFloat(style.fontSize) || 16) * 1.5;
-          const mode = node.getBoundingClientRect().height > lineHeight * 1.8 ? '6' : '7';
-          const rect = optionTextRect(node);
-          const pixels = await capturePixels({ownerDocument:node.ownerDocument,getBoundingClientRect:()=>rect});
-          const image = resizeOptionImage(pixels, (parseFloat(style.fontSize) || 16) * pixels.width / rect.width);
-          const {data} = await deadline(worker.recognize(image, {tessedit_pageseg_mode:mode}, {text:true,blocks:false,hocr:false,tsv:false}), 30000, '逐项识别超时');
-          if (!active()) throw new Error('自动选择已停止');
-          if (Number.isFinite(data.confidence) && data.confidence < 60) throw new Error(`第 ${i+1} 个选项 OCR 置信度不足，已停止；请手动核对`);
-          try { readings.push(identifyOptionText(data.text, best.question.options)); }
-          catch (_) { throw new Error(`第 ${i+1} 个页面选项识别为“${String(data.text || '').trim()}”，与题库不能唯一对应，已停止`); }
+        if (preferred?.mappingScore >= 0.55 || !captureStream?.active) {
+          if (preferred) return finish(preferred);
+          throw new Error('选项尚未显示，等待页面加载');
+        }
+        // 逐项识别只用于改善对应关系；置信度和文字差异均作为提示。
+        const readings = [], readingWarnings = [];
+        try {
+          const worker = await deadline(getOCRWorker(), 90000, 'OCR 引擎未就绪');
+          for (let i = 0; i < context.nodes.length; i++) {
+            if (!active()) throw new Error('自动选择已取消');
+            verifyAutoContext(context, null, false);
+            autoAnswer.update(`正在识别选项 ${i+1}/${context.nodes.length}…`);
+            const node = context.nodes[i], style = node.ownerDocument.defaultView.getComputedStyle(node);
+            const lineHeight = parseFloat(style.lineHeight) || (parseFloat(style.fontSize) || 16) * 1.5;
+            const mode = node.getBoundingClientRect().height > lineHeight * 1.8 ? '6' : '7';
+            const rect = optionTextRect(node);
+            const pixels = await capturePixels({ownerDocument:node.ownerDocument,getBoundingClientRect:()=>rect});
+            const image = resizeOptionImage(pixels, (parseFloat(style.fontSize) || 16) * pixels.width / rect.width);
+            const {data} = await deadline(worker.recognize(image, {tessedit_pageseg_mode:mode}, {text:true,blocks:false,hocr:false,tsv:false}), 30000, '逐项识别超时');
+            if (!active()) throw new Error('自动选择已取消');
+            readings.push(String(data.text || '').trim());
+            if (Number.isFinite(data.confidence) && data.confidence < 60) readingWarnings.push(`第 ${i+1} 个选项 OCR 置信度 ${Math.round(data.confidence)}，请核对`);
+          }
+          const plan = planAutoAnswer(context.matches, readings);
+          if (!preferred || plan.mappingScore > preferred.mappingScore) preferred = plan;
+        } catch (error) {
+          if (!active() || !preferred) throw error;
+          preferred.warnings.push('逐项 OCR 未完成，已采用现有选项匹配');
         }
         verifyAutoContext(context, null, false);
-        return planAutoAnswer(context.matches, readings);
+        preferred.warnings.push(...readingWarnings);
+        return finish(preferred);
       },
       verify: verifyAutoContext,
-      guard: (context, cancel) => {
-        const docs = [...new Set([document, context.target.ownerDocument])];
+      guard: (_context, cancel) => {
+        const listeners = new Map();
         const listener = event => {
           if (!event.isTrusted) return;
-          if ((event.type === 'keydown' && event.key === 'Escape') || context.nodes.some(node => node.contains(event.target))) cancel();
+          if (event.type === 'keydown' && event.key === 'Escape') { cancel(); return; }
+          let nodes;
+          try { const target = findQuestion(); nodes = target ? pageOptions(target) : []; } catch (_) { return; }
+          // 鼠标、触摸及键盘改选都会在识别/匹配完成前取消，脚本点击不触发此分支。
+          if (event.type === 'keydown' && ![' ', 'Spacebar', 'Enter', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+          if (nodes.some(node => node.contains(event.target))) cancel();
         };
-        // input.click() 的默认行为也会产生 trusted change，不能把它误判为人工操作。
-        for (const doc of docs) for (const name of ['pointerdown', 'keydown']) doc.addEventListener(name, listener, true);
-        return () => { for (const doc of docs) for (const name of ['pointerdown', 'keydown']) doc.removeEventListener(name, listener, true); };
+        const refresh = () => {
+          const docs = new Set([document, ...documents()]);
+          for (const [doc] of listeners) if (!docs.has(doc)) {
+            for (const name of ['pointerdown', 'click', 'keydown']) doc.removeEventListener(name, listener, true);
+            listeners.delete(doc);
+          }
+          for (const doc of docs) if (!listeners.has(doc)) {
+            for (const name of ['pointerdown', 'click', 'keydown']) doc.addEventListener(name, listener, true);
+            listeners.set(doc, true);
+          }
+        };
+        refresh();
+        const timer = setInterval(refresh, 600);
+        return () => {
+          clearInterval(timer);
+          for (const [doc] of listeners) for (const name of ['pointerdown', 'click', 'keydown']) doc.removeEventListener(name, listener, true);
+        };
       },
       choose: async (context, plan, active) => {
         for (let i = 0; i < context.nodes.length; i++) {
@@ -793,29 +887,37 @@
   async function toggleAutoAnswer() {
     if (autoAnswer.enabled) { autoAnswer.stop('已手动停止自动选择；已选中的选项保留'); return; }
     if (state.busy || capturePending) { ui.autoAnswerStatus.textContent = '请等待当前识别或共享授权完成，再开始自动选择'; return; }
-    if (!state.index) { autoAnswer.stop('请先导入题库'); return; }
+    if (!state.index) { autoAnswer.update('请先导入题库'); return; }
     const target = findQuestion();
-    if (!target) { autoAnswer.stop('请先打开当前单元的题目'); return; }
-    if (!captureStream?.active && !trustedPageText(state.index, target.innerText || '')) {
-      ui.autoAnswerStatus.textContent = '页面有防复制文字，请在弹窗中共享当前标签页';
-      await toggleCapture();
-      if (!captureStream?.active) { autoAnswer.stop('未连接真实画面共享，自动选择未启动'); return; }
-    }
+    if (!target) { autoAnswer.update('请先打开当前单元的题目'); return; }
     state.auto = true; ui.auto.checked = true;
     state.fingerprint = ''; state.stable = ''; state.attempt = '';
     autoAnswer.start(unitKey());
+    const serial = autoAnswer.serial;
+    if (!captureStream?.active && !trustedPageText(state.index, target.innerText || '')) {
+      autoAnswer.update('页面有防复制文字，请在弹窗中共享当前标签页');
+      await toggleCapture();
+      if (!autoAnswer.enabled || autoAnswer.serial !== serial) return;
+      if (!captureStream?.active) { autoAnswer.update('未连接真实画面共享；自动选择保持开启，连接共享后继续。'); return; }
+    }
     void recognize(true);
   }
-  function clearResults(message) { ui.results.replaceChildren(element('p', message, 'hint')); }
+  function clearResults(message) {
+    if (ui.resultsKey === message) return;
+    ui.resultsKey = message; ui.results.replaceChildren(element('p', message, 'hint'));
+  }
+  function keepResults(message) { if (!ui.results?.querySelector('.card')) clearResults(message); }
   function renderResults(text) {
     state.epoch++;
     if (!state.index) { clearResults('请先导入 question_bank.json。'); return; }
     if (normalize(text).length < 2) { clearResults('请输入至少两个字，或识别当前题目。'); return; }
     const matches = state.index.search(text);
-    ui.results.replaceChildren();
     if (!matches.length) { clearResults('未找到相关题目。可修正 OCR 文本，或输入有区分度的关键词。'); return; }
+    const resultsKey = JSON.stringify(matches.map(match => [match.question, match.score, match.matchReason]));
+    if (ui.resultsKey === resultsKey) return;
+    const fragment = document.createDocumentFragment();
     const close = matches.length > 1 && matches[0].score - matches[1].score < 0.06;
-    ui.results.append(element('p', `${matches.length} 个候选 · 匹配分仅用于排序${close ? ' · 前几项接近，请结合选项核对' : ''}`, 'hint'));
+    fragment.append(element('p', `${matches.length} 个候选 · 匹配分仅用于排序${close ? ' · 前几项接近，请结合选项核对' : ''}`, 'hint'));
     const warningNames = { conflicting_answers: '来源答案冲突', missing_answer: '原题缺答案', answer_option_not_found: '答案选项缺失', missing_options: '选项缺失', inline_answer_conflict: '行内答案冲突', unrecognized_choice_answer: '答案格式待核对' };
     matches.forEach((match, i) => {
       const q = match.question, card = element('article', undefined, 'card');
@@ -830,11 +932,12 @@
       card.append(answer, list);
       if (q.explanation) card.append(element('p', `解析：${q.explanation}`));
       if (q.status === 'needs_review' || q.warnings.length) card.append(element('p', `待核对：${q.warnings.map(w => warningNames[w] || w).join('、') || '题库已标记待核对'}`, 'warning'));
-      if (match.score < 0.5) card.append(element('p', '匹配较弱，请核对题干、否定词及选项。', 'warning'));
+      if (match.score < 0.6) card.append(element('p', '匹配分低于 60，仅提示；自动选择继续，请核对题干、否定词及选项。', 'warning'));
       const sources = [...new Set(q.sources.map(s => `${s.file.split(/[\\/]/).pop()}${s.line_start ? `:${s.line_start}` : ''}${s.chapter ? ` · ${s.chapter}` : ''}`))];
       if (sources.length) card.append(element('div', `来源：${sources.join('；')}`, 'source'));
-      ui.results.append(card);
+      fragment.append(card);
     });
+    ui.resultsKey = resultsKey; ui.results.replaceChildren(fragment);
   }
 
   async function recognize(manual = false) {
@@ -843,7 +946,7 @@
     const autoSerial = autoAnswer?.enabled ? autoAnswer.serial : null;
     if (!state.index) { status('请先导入 JSON 题库'); return; }
     const target = findQuestion();
-    if (!target) { status('未找到可见题目。请打开题目页面，或手动粘贴关键词检索。'); if (autoAnswer?.enabled) autoAnswer.stop('当前题目不可见，自动选择停止'); return; }
+    if (!target) { status('未找到可见题目。请打开题目页面，或手动粘贴关键词检索。'); if (autoAnswer?.enabled) autoAnswer.update('当前题目不可见，自动选择保持开启，等待题目出现。'); return; }
     const signature = fingerprint(target);
     if (!manual && signature === state.fingerprint) return;
     if (!manual && signature === state.attempt && Date.now() - state.attemptAt < 30000) return;
@@ -851,7 +954,7 @@
     const epoch = ++state.epoch;
     state.busy = true; ui.ocr.disabled = true;
     ui.imageButton.disabled = true;
-    clearResults('正在识别当前题目…'); status('正在读取题目文字…');
+    keepResults('正在识别当前题目…'); status('正在读取题目文字…');
     try {
       const pageText = String(target.innerText || '').trim();
       let text, confidence = null, elapsedMs = null, method = '页面文字';
@@ -865,7 +968,7 @@
           clearResults('请点击“开启真实画面识别”，授权共享当前标签页；或用系统截图工具截取题目，再点击“导入截图识别”。');
           status('需要真实截图。按钮变为“停止画面读取”才表示共享成功；取消、失败或刷新后需要重新开启。');
           state.fingerprint = signature; state.stable = signature;
-          if (autoAnswer?.enabled) autoAnswer.stop('需要真实画面共享，自动选择停止');
+          if (autoAnswer?.enabled) autoAnswer.update('需要真实画面共享；自动选择保持开启，连接共享后继续。');
           return;
         }
         if ([...target.querySelectorAll('img')].some(img => !img.complete)) throw new Error('题目图片尚未加载，稍后重试');
@@ -879,8 +982,8 @@
       }
       if (state.epoch !== epoch) return;
       if (!target.isConnected || fingerprint(target) !== signature || (!manual && !state.auto)) {
-        if (autoAnswer?.enabled) autoAnswer.stop('识别期间题目已变化，自动选择停止');
-        clearResults('页面题目已变化，等待重新识别。'); status('已丢弃过期 OCR 结果'); return;
+        if (autoAnswer?.enabled) autoAnswer.defer('识别期间题目已变化');
+        keepResults('页面题目已变化，等待重新识别。'); status('已丢弃过期 OCR 结果'); return;
       }
       if (normalize(text).length < 2) throw new Error('OCR 未识别到有效文字，请手动输入关键词');
       state.fingerprint = signature; state.stable = signature; state.seenAt = Date.now(); ui.query.value = text;
@@ -893,14 +996,14 @@
         await autoAnswer.accept({ target, signature, unit: unitKey(), text, confidence, matches: state.index.search(text) });
       }
     } catch (error) {
-      if (autoAnswer?.enabled && autoAnswer.serial === autoSerial) autoAnswer.stop(`识别或选项处理失败：${error.message || error}`);
-      if (state.epoch === epoch) { clearResults('识别失败，可手动输入关键词检索。'); status(`OCR 失败：${error.message || error}`); }
+      if (autoAnswer?.enabled && autoAnswer.serial === autoSerial) autoAnswer.defer(`识别或选项处理遇到问题：${error.message || error}`);
+      if (state.epoch === epoch) { keepResults('识别失败，可手动输入关键词检索。'); status(`OCR 失败：${error.message || error}`); }
     } finally { state.busy = false; ui.ocr.disabled = false; ui.imageButton.disabled = false; }
   }
 
   async function importBank(file) {
     if (!file) return;
-    if (autoAnswer?.enabled) autoAnswer.stop('题库正在更换，自动选择停止');
+    if (autoAnswer?.enabled) autoAnswer.defer('正在更换题库');
     state.epoch++; ui.importButton.disabled = true; status('正在校验题库…');
     try {
       if (file.size > 20 * 1024 * 1024) throw new Error('文件超过 20 MB，请拆分题库');
@@ -986,7 +1089,8 @@
     apply(geometry);
     return {
       collapse() { collapsed = !collapsed; panel.classList.toggle('collapsed', collapsed); apply(geometry); persist(); return collapsed; },
-      reset() { apply(null); persist(); }
+      reset() { apply(null); persist(); },
+      moveTo(position) { apply({ ...geometry, ...position }); persist(); }
     };
   }
 
@@ -998,7 +1102,7 @@
       :host{font-family:system-ui,-apple-system,"Microsoft YaHei",sans-serif;color:#202b3c;font-size:14px;line-height:1.6;color-scheme:light}
       *{box-sizing:border-box}.panel{position:relative;display:flex;flex-direction:column;background:#fff;border:1px solid #cfd8e5;border-radius:12px;box-shadow:0 10px 36px #17253a30;overflow:hidden}
       header{padding:12px 14px;background:#eef4fb;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-shrink:0;cursor:move;touch-action:none;user-select:none}h2{font-size:15px;margin:0;min-width:0}.window-actions{display:flex;gap:6px;flex-shrink:0}h3{font-size:14px;margin:7px 0;white-space:pre-wrap;overflow-wrap:anywhere}
-      button{font:inherit;font-size:13px;padding:5px 10px;border:1px solid #c2cfe1;border-radius:6px;background:#fff;color:#234877;cursor:pointer}button:hover{background:#edf4ff}button:disabled{opacity:.55;cursor:wait}button.primary{background:#285b98;color:#fff;border-color:#285b98}
+      button{font:inherit;font-size:13px;padding:5px 10px;border:1px solid #c2cfe1;border-radius:6px;background:#fff;color:#234877;cursor:pointer}button:hover{background:#edf4ff}button:disabled{opacity:.55;cursor:wait}button.primary{background:#285b98;color:#fff;border-color:#285b98}button.danger{background:#c93636;color:#fff;border-color:#c93636}button.danger:hover{background:#aa2525;border-color:#aa2525}
       .body{padding:12px 14px 24px;overflow:auto;overscroll-behavior:contain;min-height:0;flex:1}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.bank,.hint,.source{font-size:12px;color:#5d6d81;overflow-wrap:anywhere}.bank{margin-bottom:9px}
       .controls-toolbar{position:sticky;top:-12px;z-index:1;background:#fff;padding:4px 0 9px}.controls-toolbar button{width:100%;text-align:left}.controls[hidden]{display:none}
       .auto-answer-bar{border:1px solid #d4dfec;background:#f5f8fc;border-radius:7px;padding:8px;margin-bottom:10px}.auto-answer-status{font-size:12px;color:#3f5c7c;margin-top:5px;overflow-wrap:anywhere}
@@ -1010,7 +1114,7 @@
       details{font-size:12px;color:#526880;margin:8px 0}summary{cursor:pointer}details img{display:block;max-width:100%;max-height:240px;object-fit:contain;border:1px solid #d9e2ee;margin-top:6px}
     `;
     const panel = element('section', undefined, 'panel'), header = element('header'), collapse = element('button', '收起');
-    header.append(element('h2', '题库检索 5.1.2')); header.title = '拖动标题栏移动窗口';
+    header.append(element('h2', '题库检索 5.2.0')); header.title = '拖动标题栏移动窗口';
     let geometryControl;
     collapse.onclick = () => { collapse.textContent = geometryControl.collapse() ? '展开' : '收起'; };
     const reset = element('button', '复位'); reset.title = '恢复窗口默认位置和大小'; reset.onclick = () => geometryControl.reset();
@@ -1019,7 +1123,7 @@
     const importButton = element('button', '导入 JSON'), file = element('input');
     file.type = 'file'; file.accept = '.json,application/json'; file.hidden = true;
     importButton.onclick = () => file.click(); file.onchange = () => void importBank(file.files[0]);
-    const ocr = element('button', '识别当前题目'); ocr.onclick = () => { if (autoAnswer?.enabled) autoAnswer.stop('已切换为手动识别，自动选择停止'); void recognize(true); };
+    const ocr = element('button', '识别当前题目'); ocr.onclick = () => { if (autoAnswer?.enabled) autoAnswer.defer('重新识别当前题目'); void recognize(true); };
     const imageButton = element('button', '导入截图识别'), imageFile = element('input');
     imageButton.onpointerenter = warmOCR;
     imageFile.type = 'file'; imageFile.accept = 'image/png,image/jpeg,image/webp'; imageFile.hidden = true;
@@ -1027,9 +1131,9 @@
     const capture = element('button', '开启真实画面识别'); capture.onclick = () => void toggleCapture();
     const autoLabel = element('label'), auto = element('input'); auto.type = 'checkbox'; auto.checked = state.auto;
     auto.onchange = async () => {
-      if (autoAnswer?.enabled) autoAnswer.stop('自动识别设置已改变，自动选择停止');
+      if (autoAnswer?.enabled) auto.checked = true;
       state.auto = auto.checked; state.epoch++; state.fingerprint = ''; state.attempt = '';
-      if (state.busy) clearResults('自动识别设置已变化，等待当前 OCR 结束。');
+      if (state.busy) keepResults('自动识别设置已变化，等待当前 OCR 结束。');
       try { await GM_setValue(KEYS.auto, state.auto); status(state.auto ? '自动 OCR 已开启' : '自动 OCR 已关闭，可手动检索'); }
       catch (error) { status(`设置保存失败：${error.message || error}`); }
     };
@@ -1037,14 +1141,13 @@
     const query = element('textarea'); query.placeholder = '拖入题目截图，或点击此处按 ⌘ / Ctrl + V 粘贴图片，即可识别并检索。也可输入关键词，按 ⌘ / Ctrl + Enter 检索。'; query.setAttribute('aria-label', 'OCR 文本或检索关键词');
     bindScreenshotInput(query, recognizeScreenshot, status);
     query.oninput = () => {
-      if (autoAnswer?.enabled) autoAnswer.stop('检索文字被手动编辑，自动选择停止');
       state.epoch++;
       // 手动编辑后暂停当前题的自动识别，直到切题或手动重新识别。
       const signature = fingerprint(findQuestion()); state.fingerprint = signature; state.stable = signature;
       status('文本已编辑，点击“检索题库”查看结果；当前题自动识别已暂停');
     };
     const search = element('button', '检索题库', 'primary');
-    search.onclick = () => { if (autoAnswer?.enabled) autoAnswer.stop('已切换为手动检索，自动选择停止'); const started = performance.now(); renderResults(query.value); status(`检索完成 · ${(performance.now() - started).toFixed(0)} 毫秒`); };
+    search.onclick = () => { const started = performance.now(); renderResults(query.value); status(`检索完成 · ${(performance.now() - started).toFixed(0)} 毫秒`); };
     query.onkeydown = event => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); search.click(); } };
     const message = element('div', '导入转换脚本生成的 question_bank.json 后开始。', 'status'); message.setAttribute('role', 'status'); message.setAttribute('aria-live', 'polite');
     const results = element('div', undefined, 'results'), note = element('p', '答案字母按题库原顺序展示，请结合选项文字核对。题库与检索保存在脚本本地存储。', 'note');
@@ -1072,25 +1175,28 @@
     applyControlsVisibility(); controlsToolbar.append(toggleControls);
     const autoAnswerBar = element('div', undefined, 'auto-answer-bar'), autoAnswerRow = element('div', undefined, 'row');
     const autoAnswerButton = element('button', '自动选择选项', 'primary');
-    const autoAnswerStatus = element('div', '未开启。首项匹配分 ≥ 60 且答案明确时自动选择，提交请手动操作。', 'auto-answer-status'); autoAnswerStatus.setAttribute('role', 'status'); autoAnswerStatus.setAttribute('aria-live', 'polite');
-    autoAnswerButton.onclick = () => void toggleAutoAnswer().catch(error => autoAnswer.stop(`启动失败：${error.message || error}`));
+    const autoAnswerStatus = element('div', '未开启。按首项候选选择，低于 60 分仅提示；手动改选或取消时关闭。提交请手动操作。', 'auto-answer-status'); autoAnswerStatus.setAttribute('role', 'status'); autoAnswerStatus.setAttribute('aria-live', 'polite');
+    autoAnswerButton.setAttribute('aria-pressed', 'false');
+    autoAnswerButton.onclick = () => void toggleAutoAnswer().catch(error => { if (autoAnswer.enabled) autoAnswer.defer(`启动遇到问题：${error.message || error}`); else autoAnswer.update(`启动遇到问题：${error.message || error}`); });
     autoAnswerRow.append(autoAnswerButton); autoAnswerBar.append(autoAnswerRow, autoAnswerStatus);
     body.append(controlsToolbar, autoAnswerBar, controls, results); panel.append(header, body, resizeHandle); shadow.append(style, panel); document.body.append(host);
     ui = { bank, importButton, file, ocr, capture, captureState, source, imageButton, imageFile, preview, previewLabel, previewImage, auto, query, autoAnswerButton, autoAnswerStatus, status: message, results };
     geometryControl = enablePanelGeometry(panel, header, resizeHandle, savedGeometry);
+    ui.geometry = geometryControl;
   }
 
   async function tick() {
+    if (document.hidden) return;
     if (autoAnswer?.enabled && autoAnswer.poll()) return;
     if (!state.auto || !state.index || state.busy || capturePending || document.hidden) return;
     const signature = fingerprint(findQuestion());
     if (!signature) {
-      if (state.stable) { state.stable = ''; state.fingerprint = ''; state.epoch++; clearResults('当前没有可见题目，等待打开题目页面。'); }
+      if (state.stable) { state.stable = ''; state.fingerprint = ''; state.epoch++; keepResults('当前没有可见题目，等待打开题目页面。'); }
       return;
     }
     if (signature !== state.stable) {
       state.stable = signature; state.seenAt = Date.now(); state.epoch++;
-      clearResults('检测到当前题目，等待页面稳定后识别…'); return;
+      keepResults('检测到当前题目，等待页面稳定后识别…'); status('检测到当前题目，等待页面稳定后识别…'); return;
     }
     if (Date.now() - state.seenAt > 400) await recognize();
   }
@@ -1113,11 +1219,15 @@
       if (window.requestIdleCallback) window.requestIdleCallback(warmOCR, { timeout: 1500 });
       else setTimeout(warmOCR, 500);
     }
-    const startTimer = () => setInterval(() => { void tick().catch(error => { if (autoAnswer?.enabled) autoAnswer.stop(`页面检测失败：${error.message || error}`); status(`页面检测失败：${error.message || error}`); }); }, 600);
+    const startTimer = () => setInterval(() => { void tick().catch(error => { if (autoAnswer?.enabled) autoAnswer.defer(`页面检测遇到问题：${error.message || error}`); status(`页面检测失败：${error.message || error}`); }); }, 600);
     let timer = startTimer();
-    window.addEventListener('pagehide', () => { clearInterval(timer); state.epoch++; stopCapture(); if (ui.previewURL) URL.revokeObjectURL(ui.previewURL); const old = workerPromise; workerPromise = null; old?.then(w => w.terminate()).catch(() => {}); });
+    window.addEventListener('pagehide', () => { autoAnswer.stop('页面已关闭或离开，自动选择结束'); clearInterval(timer); state.epoch++; stopCapture(); if (ui.previewURL) URL.revokeObjectURL(ui.previewURL); const old = workerPromise; workerPromise = null; old?.then(w => w.terminate()).catch(() => {}); });
     window.addEventListener('pageshow', event => { if (event.persisted) { clearInterval(timer); timer = startTimer(); state.fingerprint = ''; } });
-    document.addEventListener('visibilitychange', () => { if (document.hidden && autoAnswer?.enabled) autoAnswer.stop('页面已转入后台，自动选择停止'); });
+    document.addEventListener('visibilitychange', () => {
+      if (!autoAnswer?.enabled) return;
+      if (document.hidden) { state.epoch++; autoAnswer.defer('页面在后台，回到当前页后继续'); }
+      else { state.fingerprint = ''; state.attempt = ''; autoAnswer.update('已回到页面，自动选择继续。'); }
+    });
   }
   void boot();
 })();
